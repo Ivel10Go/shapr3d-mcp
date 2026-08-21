@@ -16,8 +16,9 @@ So this server takes the only robust route:
 2. **STEP file exchange.** Generated models export as STEP, which Shapr3D
    imports as fully **editable solid bodies**. Files you export *from*
    Shapr3D (STEP/IGES/STL) can be inspected, modified, and converted.
-3. **macOS app bridge.** Tools to launch Shapr3D, open files in it, check its
-   state, and screenshot its window for visual feedback.
+3. **App bridge (macOS & Windows).** Tools to launch Shapr3D, open files in
+   it, check its state, and screenshot its window for visual feedback — on
+   whichever of the two platforms Shapr3D's native app runs.
 
 ```
 AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.step ──▶ Shapr3D
@@ -43,11 +44,20 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 ## Setup
 
-Requires macOS, [uv](https://docs.astral.sh/uv/), and Shapr3D installed.
+Requires macOS or Windows, [uv](https://docs.astral.sh/uv/), and Shapr3D
+installed (the modeling tools also run fine on Linux/without Shapr3D — only
+`open_in_shapr3d` / `shapr3d_status` / `activate_shapr3d` /
+`screenshot_shapr3d` need one of the two platforms Shapr3D ships a native
+app for).
 
 ```sh
 uv sync
 ```
+
+On Windows, run this from a terminal (PowerShell or cmd) with
+[uv](https://docs.astral.sh/uv/) installed the same way; no other setup is
+needed — `pywin32` (used for the app-bridge window lookups) is pulled in
+automatically as part of `uv sync`.
 
 ### Claude Code
 
@@ -60,7 +70,8 @@ claude mcp add shapr3d -s user -- uv run --directory "<path-to-this-folder>" sha
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -105,6 +116,11 @@ Shapr3D app needed) in a throwaway workspace.
   on imported solids regardless.
 - In-app actions (sketching, export) happen via the user or OS-level
   computer-use automation; there is no app API to drive.
+- Shapr3D has no Linux app, so the app-bridge tools raise on Linux; the
+  modeling/inspection/conversion tools are unaffected and work anywhere.
+- On Windows, locating and focusing the Shapr3D window is best-effort
+  (install-path search plus window-title matching) since there is no
+  equivalent of macOS's `osascript`/Accessibility APIs.
 
 ## License
 

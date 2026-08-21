@@ -26,9 +26,26 @@ def test_safe_name_sanitizes():
     assert server._safe_name("bracket v1.2") == "bracket v1.2"
 
 
+def test_safe_name_avoids_windows_reserved_device_names():
+    assert server._safe_name("CON") == "_CON"
+    assert server._safe_name("com1") == "_com1"
+    assert server._safe_name("nul.step") == "_nul.step"
+
+
+def test_safe_name_strips_trailing_dot_and_space():
+    # Windows silently drops a trailing '.' or ' ' from filenames, which
+    # would otherwise desync the name we report from the file actually
+    # written.
+    assert server._safe_name("bracket. ") == "bracket"
+
+
 def test_resolve_relative_against_workdir():
     assert server._resolve("foo.step") == WORKDIR / "foo.step"
-    assert server._resolve("/tmp/abs.step") == Path("/tmp/abs.step")
+
+
+def test_resolve_absolute_path_untouched(tmp_path):
+    abs_path = tmp_path / "abs.step"
+    assert server._resolve(str(abs_path)) == abs_path
 
 
 # ---------------------------------------------------------------------------
