@@ -7,13 +7,19 @@ Shapr3D has no public API, so this server pairs a real CAD kernel
   imports as fully editable bodies.
 - Inspect and modify STEP/STL/BREP files exported from Shapr3D.
 - Open files in Shapr3D and capture its window for visual feedback.
+
+The modeling tools run anywhere Python + OpenCascade run. The Shapr3D app
+bridge works on macOS and Windows, the two platforms Shapr3D ships a native
+app for.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,7 +54,19 @@ WORKDIR = Path(
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 APP_NAME = "Shapr3D"
+WINDOWS_EXE_NAME = "Shapr3D.exe"
 IMPORT_FORMATS = {".step", ".stp", ".stl", ".brep", ".iges", ".igs"}
+
+IS_MACOS = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
+
+# Reserved on Windows regardless of extension (CON, COM1, LPT1, ...); using
+# one as a filename silently fails or addresses a device instead of a file.
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +74,11 @@ IMPORT_FORMATS = {".step", ".stp", ".stl", ".brep", ".iges", ".igs"}
 # ---------------------------------------------------------------------------
 
 def _safe_name(name: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip() or "model"
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip()
+    # Windows also rejects filenames ending in '.' or ' '.
+    name = name.rstrip(". ") or "model"
+    if name.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
     return name
 
 
@@ -259,6 +281,75 @@ def _osascript(script: str) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip())
     return proc.stdout.strip()
+
+
+def _windows_shapr3d_exe() -> Path | None:
+    """Best-effort search for the installed Shapr3D executable on Windows."""
+    which = shutil.which(WINDOWS_EXE_NAME) or shutil.which(APP_NAME)
+    candidates = [Path(which)] if which else []
+    for env_var, sub in (
+        ("LOCALAPPDATA", "Programs"),
+        ("ProgramFiles", None),
+        ("ProgramFiles(x86)", None),
+    ):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        base_path = Path(base) / sub if sub else Path(base)
+        candidates.append(base_path / APP_NAME / WINDOWS_EXE_NAME)
+    try:
+        import winreg
+
+        key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % (
+            WINDOWS_EXE_NAME
+        )
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    candidates.append(Path(winreg.QueryValueEx(key, "")[0]))
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _windows_process_running(image_name: str) -> bool:
+    proc = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/NH"],
+        capture_output=True, text=True, timeout=15,
+    )
+    return image_name.lower() in proc.stdout.lower()
+
+
+def _windows_find_window() -> int | None:
+    """Best-effort: first visible top-level window whose title mentions
+    Shapr3D. Requires pywin32 (already pulled in by mcp[cli] on Windows)."""
+    import win32gui
+
+    matches: list[int] = []
+
+    def _cb(hwnd: int, _lparam) -> bool:
+        if win32gui.IsWindowVisible(hwnd) and APP_NAME.lower() in win32gui.GetWindowText(hwnd).lower():
+            matches.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    return matches[0] if matches else None
+
+
+def _windows_frontmost() -> bool | None:
+    try:
+        import win32gui
+    except ImportError:
+        return None
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return False
+    return APP_NAME.lower() in win32gui.GetWindowText(hwnd).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +632,7 @@ def list_models() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Shapr3D app bridge (macOS)
+# Shapr3D app bridge (macOS and Windows - Shapr3D has no Linux build)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -551,7 +642,19 @@ def open_in_shapr3d(path: str) -> str:
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
+    if IS_MACOS:
+        subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
+    elif IS_WINDOWS:
+        exe = _windows_shapr3d_exe()
+        if exe:
+            subprocess.Popen([str(exe), str(src)])
+        else:
+            # Falls back to whatever app is registered for the extension.
+            os.startfile(str(src))  # noqa: S606 - Windows-only branch
+    else:
+        raise RuntimeError(
+            "open_in_shapr3d needs macOS or Windows (Shapr3D has no Linux app)."
+        )
     return (
         f"Sent {src.name} to Shapr3D. The app shows an Import Preferences "
         "dialog (Quality/Speed/Custom); the user clicks Import. STEP files "
@@ -562,20 +665,26 @@ def open_in_shapr3d(path: str) -> str:
 @mcp.tool()
 def shapr3d_status() -> dict:
     """Check whether Shapr3D is installed, running, and frontmost."""
-    installed = Path(f"/Applications/{APP_NAME}.app").exists()
-    running = subprocess.run(
-        ["pgrep", "-x", APP_NAME], capture_output=True
-    ).returncode == 0
-    frontmost = None
-    if running:
-        try:
-            front = _osascript(
-                'tell application "System Events" to get name of first '
-                "application process whose frontmost is true"
-            )
-            frontmost = front == APP_NAME
-        except Exception:
-            pass
+    installed = running = frontmost = None
+    if IS_MACOS:
+        installed = Path(f"/Applications/{APP_NAME}.app").exists()
+        running = subprocess.run(
+            ["pgrep", "-x", APP_NAME], capture_output=True
+        ).returncode == 0
+        if running:
+            try:
+                front = _osascript(
+                    'tell application "System Events" to get name of first '
+                    "application process whose frontmost is true"
+                )
+                frontmost = front == APP_NAME
+            except Exception:
+                pass
+    elif IS_WINDOWS:
+        installed = _windows_shapr3d_exe() is not None
+        running = _windows_process_running(WINDOWS_EXE_NAME)
+        if running:
+            frontmost = _windows_frontmost()
     return {
         "installed": installed,
         "running": running,
@@ -592,30 +701,73 @@ def shapr3d_status() -> dict:
 @mcp.tool()
 def activate_shapr3d() -> str:
     """Launch Shapr3D (if needed) and bring it to the foreground."""
-    subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
+    if IS_MACOS:
+        subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
+    elif IS_WINDOWS:
+        if _windows_process_running(WINDOWS_EXE_NAME):
+            try:
+                import win32gui
+
+                hwnd = _windows_find_window()
+                if hwnd:
+                    win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass  # best-effort; app is already running either way
+        else:
+            exe = _windows_shapr3d_exe()
+            if not exe:
+                raise RuntimeError(
+                    "Shapr3D executable not found. Install Shapr3D or launch "
+                    "it manually."
+                )
+            subprocess.Popen([str(exe)])
+    else:
+        raise RuntimeError(
+            "activate_shapr3d needs macOS or Windows (Shapr3D has no Linux app)."
+        )
     return "Shapr3D activated."
 
 
 @mcp.tool()
 def screenshot_shapr3d() -> Image:
     """Capture a screenshot of the Shapr3D window to see the current state
-    of the model/app. Requires Screen Recording permission for the host
-    process the first time."""
-    if subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True).returncode != 0:
-        raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
-    try:
-        bounds = _osascript(
-            f'tell application "System Events" to tell process "{APP_NAME}" to '
-            "get {position, size} of front window"
-        )
-        x, y, w, h = [int(v.strip()) for v in bounds.split(",")]
-        region = ["-R", f"{x},{y},{w},{h}"]
-    except Exception:
-        region = []  # fall back to full screen
+    of the model/app. On macOS this requires Screen Recording permission
+    for the host process the first time."""
     out = WORKDIR / "_shapr3d_screenshot.png"
-    subprocess.run(
-        ["screencapture", "-x", *region, str(out)], check=True, timeout=15
-    )
+    if IS_MACOS:
+        if subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True).returncode != 0:
+            raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
+        try:
+            bounds = _osascript(
+                f'tell application "System Events" to tell process "{APP_NAME}" to '
+                "get {position, size} of front window"
+            )
+            x, y, w, h = [int(v.strip()) for v in bounds.split(",")]
+            region = ["-R", f"{x},{y},{w},{h}"]
+        except Exception:
+            region = []  # fall back to full screen
+        subprocess.run(
+            ["screencapture", "-x", *region, str(out)], check=True, timeout=15
+        )
+    elif IS_WINDOWS:
+        if not _windows_process_running(WINDOWS_EXE_NAME):
+            raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
+        from PIL import ImageGrab
+
+        bbox = None
+        try:
+            import win32gui
+
+            hwnd = _windows_find_window()
+            if hwnd:
+                bbox = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            pass  # fall back to full-screen capture
+        ImageGrab.grab(bbox=bbox).save(out)
+    else:
+        raise RuntimeError(
+            "screenshot_shapr3d needs macOS or Windows (Shapr3D has no Linux app)."
+        )
     return Image(path=str(out))
 
 
